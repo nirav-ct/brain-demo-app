@@ -1,14 +1,17 @@
 """Authentication API endpoints.
 
 Handles user registration, login, token refresh, and session management.
+Includes CSRF protection for state-changing operations.
 """
 
 import hashlib
+import hmac
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -16,6 +19,11 @@ from src.config.settings import settings
 from src.models.user import User, get_db
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
+
+CSRF_TOKEN_BYTES = 32
+CSRF_COOKIE_NAME = "csrf_token"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 class LoginRequest(BaseModel):
@@ -54,8 +62,60 @@ def _create_jwt(user_id: int, email: str) -> tuple[str, int]:
     return token, int(expires_delta.total_seconds())
 
 
-@router.post("/register", response_model=TokenResponse)
-def register(body: RegisterRequest, db: Session = Depends(get_db)):
+def _generate_csrf_token() -> str:
+    """Generate a cryptographically secure CSRF token."""
+    return secrets.token_hex(CSRF_TOKEN_BYTES)
+
+
+def _sign_csrf_token(token: str) -> str:
+    """HMAC-sign the CSRF token so we can verify server-side without storage."""
+    return hmac.new(
+        settings.JWT_SECRET.encode(), token.encode(), hashlib.sha256
+    ).hexdigest()
+
+
+def _set_csrf_cookie(response: Response) -> str:
+    """Create a new CSRF token, attach it as a cookie, and return the signed version."""
+    token = _generate_csrf_token()
+    response.set_cookie(
+        CSRF_COOKIE_NAME,
+        token,
+        httponly=False,  # JS needs to read and send back via header
+        samesite="strict",
+        secure=settings.CSRF_SECURE_COOKIE,
+        max_age=3600,
+    )
+    return token
+
+
+def verify_csrf(request: Request, csrf_token: str = Cookie(None, alias=CSRF_COOKIE_NAME)):
+    """Verify CSRF token on state-changing requests (double-submit cookie pattern)."""
+    if request.method in CSRF_SAFE_METHODS:
+        return
+
+    header_token = request.headers.get(CSRF_HEADER_NAME)
+    if not header_token or not csrf_token:
+        raise HTTPException(
+            status_code=403,
+            detail="CSRF token missing. Include X-CSRF-Token header.",
+        )
+
+    if not hmac.compare_digest(header_token, csrf_token):
+        raise HTTPException(
+            status_code=403,
+            detail="CSRF token mismatch. Possible cross-site request forgery.",
+        )
+
+
+@router.get("/csrf-token")
+def get_csrf_token(response: Response):
+    """Issue a new CSRF token. Call before any state-changing request."""
+    token = _set_csrf_cookie(response)
+    return {"csrf_token": token}
+
+
+@router.post("/register", response_model=TokenResponse, dependencies=[Depends(verify_csrf)])
+def register(body: RegisterRequest, response: Response, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == body.email).first()
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
@@ -72,12 +132,13 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
+    _set_csrf_cookie(response)
     token, expires_in = _create_jwt(user.id, user.email)
     return TokenResponse(access_token=token, expires_in=expires_in)
 
 
-@router.post("/login", response_model=TokenResponse)
-def login(body: LoginRequest, db: Session = Depends(get_db)):
+@router.post("/login", response_model=TokenResponse, dependencies=[Depends(verify_csrf)])
+def login(body: LoginRequest, response: Response, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == body.email).first()
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -89,13 +150,15 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     user.last_login = datetime.now(timezone.utc)
     db.commit()
 
+    _set_csrf_cookie(response)
     token, expires_in = _create_jwt(user.id, user.email)
     return TokenResponse(access_token=token, expires_in=expires_in)
 
 
-@router.post("/logout")
+@router.post("/logout", dependencies=[Depends(verify_csrf)])
 def logout(response: Response):
     response.delete_cookie("session_token")
+    response.delete_cookie(CSRF_COOKIE_NAME)
     return {"message": "Logged out successfully"}
 
 

@@ -40,6 +40,9 @@ class Settings:
     LOG_LEVEL: str = field(
         default_factory=lambda: os.getenv("LOG_LEVEL", "INFO")
     )
+    CSRF_SECURE_COOKIE: bool = field(
+        default_factory=lambda: os.getenv("CSRF_SECURE_COOKIE", "true").lower() == "true"
+    )
 
 
 settings = Settings()
