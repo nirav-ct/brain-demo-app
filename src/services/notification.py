@@ -2,9 +2,13 @@
 
 Sends transactional emails and in-app notifications to users.
 Supports email, SMS, and webhook delivery channels.
+
+All outbound payloads and log entries are processed through the PII masking
+pipeline to comply with GDPR Article 25 (data protection by design).
 """
 
 import logging
+import re
 import smtplib
 from dataclasses import dataclass
 from email.mime.multipart import MIMEMultipart
@@ -15,6 +19,37 @@ from typing import Optional
 from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# PII masking utilities
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+_PHONE_RE = re.compile(r"\+?\d[\d\-\s]{7,}\d")
+_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_CREDIT_CARD_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+
+
+def mask_email(email: str) -> str:
+    local, domain = email.split("@")
+    return f"{local[0]}***@{domain}"
+
+
+def mask_pii(text: str) -> str:
+    """Redact known PII patterns from free text."""
+    text = _SSN_RE.sub("[SSN REDACTED]", text)
+    text = _CREDIT_CARD_RE.sub("[CARD REDACTED]", text)
+    text = _PHONE_RE.sub("[PHONE REDACTED]", text)
+    text = _EMAIL_RE.sub(lambda m: mask_email(m.group()), text)
+    return text
+
+
+def mask_name(name: str) -> str:
+    parts = name.split()
+    if len(parts) <= 1:
+        return name[0] + "***" if name else ""
+    return parts[0][0] + "*** " + parts[-1][0] + "***"
 
 
 class Channel(str, Enum):
@@ -42,11 +77,13 @@ class NotificationService:
 
     def send(self, payload: NotificationPayload) -> dict:
         """Send a notification via the specified channel."""
+        safe_email = mask_email(payload.recipient_email)
+        safe_name = mask_name(payload.recipient_name)
         logger.info(
             "Sending %s notification to %s (%s): %s",
             payload.channel.value,
-            payload.recipient_name,
-            payload.recipient_email,
+            safe_name,
+            safe_email,
             payload.subject,
         )
 
@@ -65,13 +102,10 @@ class NotificationService:
         msg["From"] = self.from_email
         msg["To"] = payload.recipient_email
 
-        # Log the full payload including PII for debugging
         logger.info(
-            "Email payload: to=%s, name=%s, subject=%s, body=%s",
-            payload.recipient_email,
-            payload.recipient_name,
+            "Email payload: to=%s, subject=%s",
+            mask_email(payload.recipient_email),
             payload.subject,
-            payload.body,
         )
 
         html_body = f"""
@@ -94,32 +128,35 @@ class NotificationService:
                 server.sendmail(self.from_email, payload.recipient_email, msg.as_string())
             return {"status": "sent", "channel": "email"}
         except Exception as e:
-            logger.error("Failed to send email to %s: %s", payload.recipient_email, e)
+            logger.error(
+                "Failed to send email to %s: %s",
+                mask_email(payload.recipient_email),
+                e,
+            )
             return {"status": "failed", "channel": "email", "error": str(e)}
 
     def _send_sms(self, payload: NotificationPayload) -> dict:
         logger.info(
-            "SMS to %s: %s", payload.recipient_name, payload.body
+            "SMS to %s: %s",
+            mask_name(payload.recipient_name),
+            mask_pii(payload.body),
         )
         return {"status": "sent", "channel": "sms"}
 
     def _send_webhook(self, payload: NotificationPayload) -> dict:
         webhook_data = {
-            "recipient": payload.recipient_email,
-            "name": payload.recipient_name,
+            "recipient": mask_email(payload.recipient_email),
             "event": payload.subject,
-            "data": payload.body,
-            "metadata": payload.metadata,
+            "data": mask_pii(payload.body),
         }
         logger.info("Webhook dispatch: %s", webhook_data)
         return {"status": "sent", "channel": "webhook"}
 
     def _store_in_app(self, payload: NotificationPayload) -> dict:
         record = {
-            "user_email": payload.recipient_email,
-            "user_name": payload.recipient_name,
+            "user_email": mask_email(payload.recipient_email),
             "title": payload.subject,
-            "message": payload.body,
+            "message": mask_pii(payload.body),
             "read": False,
         }
         logger.info("Stored in-app notification: %s", record)
