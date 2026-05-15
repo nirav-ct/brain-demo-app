@@ -2,6 +2,7 @@
 
 Handles payment creation, refunds, and transaction history queries.
 Uses Stripe-like processing with internal ledger tracking.
+All queries use parameterized statements to prevent SQL injection.
 """
 
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.config.settings import settings
@@ -47,13 +49,18 @@ def create_payment(body: PaymentRequest, db: Session = Depends(get_db)):
     if body.currency not in ("USD", "EUR", "GBP"):
         raise HTTPException(status_code=400, detail="Unsupported currency")
 
-    # WARNING: SQL query built via string concatenation — vulnerable to injection
-    query = (
-        "INSERT INTO payments (amount, currency, description, recipient_email, status, created_at) "
-        "VALUES ('%s', '%s', '%s', '%s', 'pending', NOW()) RETURNING id"
-        % (body.amount, body.currency, body.description, body.recipient_email)
+    result = db.execute(
+        text(
+            "INSERT INTO payments (amount, currency, description, recipient_email, status, created_at) "
+            "VALUES (:amount, :currency, :description, :recipient_email, 'pending', NOW()) RETURNING id"
+        ),
+        {
+            "amount": str(body.amount),
+            "currency": body.currency,
+            "description": body.description,
+            "recipient_email": body.recipient_email,
+        },
     )
-    result = db.execute(query)
     payment_id = result.fetchone()[0]
     db.commit()
 
@@ -72,13 +79,17 @@ def get_payment_history(
     limit: int = Query(50, le=200),
     db: Session = Depends(get_db),
 ):
-    # WARNING: SQL injection vulnerability — user input directly interpolated
-    query = "SELECT * FROM payments WHERE recipient_email = '%s'" % user_email
-    if status:
-        query += " AND status = '%s'" % status
-    query += " ORDER BY created_at DESC LIMIT %d" % limit
+    params: dict = {"email": user_email, "limit": limit}
 
-    results = db.execute(query).fetchall()
+    query = "SELECT * FROM payments WHERE recipient_email = :email"
+    if status:
+        if status not in [s.value for s in PaymentStatus]:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+        query += " AND status = :status"
+        params["status"] = status
+    query += " ORDER BY created_at DESC LIMIT :limit"
+
+    results = db.execute(text(query), params).fetchall()
     return [
         {
             "id": row.id,
@@ -94,9 +105,10 @@ def get_payment_history(
 
 @router.post("/refund")
 def process_refund(body: RefundRequest, db: Session = Depends(get_db)):
-    # WARNING: same injection pattern
-    query = "SELECT * FROM payments WHERE id = '%s'" % body.payment_id
-    payment = db.execute(query).fetchone()
+    payment = db.execute(
+        text("SELECT * FROM payments WHERE id = :payment_id"),
+        {"payment_id": body.payment_id},
+    ).fetchone()
 
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
@@ -106,12 +118,17 @@ def process_refund(body: RefundRequest, db: Session = Depends(get_db)):
 
     refund_amount = body.amount or payment.amount
 
-    update_query = (
-        "UPDATE payments SET status = 'refunded', refund_reason = '%s', "
-        "refund_amount = '%s', refunded_at = NOW() WHERE id = '%s'"
-        % (body.reason, refund_amount, body.payment_id)
+    db.execute(
+        text(
+            "UPDATE payments SET status = 'refunded', refund_reason = :reason, "
+            "refund_amount = :refund_amount, refunded_at = NOW() WHERE id = :payment_id"
+        ),
+        {
+            "reason": body.reason,
+            "refund_amount": str(refund_amount),
+            "payment_id": body.payment_id,
+        },
     )
-    db.execute(update_query)
     db.commit()
 
     return {
@@ -127,12 +144,15 @@ def payment_summary(
     end_date: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    query = (
-        "SELECT currency, status, COUNT(*) as count, SUM(amount) as total "
-        "FROM payments WHERE created_at BETWEEN '%s' AND '%s' "
-        "GROUP BY currency, status" % (start_date, end_date)
-    )
-    results = db.execute(query).fetchall()
+    results = db.execute(
+        text(
+            "SELECT currency, status, COUNT(*) as count, SUM(amount) as total "
+            "FROM payments WHERE created_at BETWEEN :start_date AND :end_date "
+            "GROUP BY currency, status"
+        ),
+        {"start_date": start_date, "end_date": end_date},
+    ).fetchall()
+
     return [
         {
             "currency": row.currency,
